@@ -52,11 +52,13 @@ def update(configuration: dict, state: dict):
     sheet_ids_raw = configuration.get("smartsheet_sheet_ids", "")
     sheet_ids = [s.strip() for s in sheet_ids_raw.split(",") if s.strip()]
     sync_cursor = state.get('sync_cursor')
+    # sync_cursor = None
     # 7-day window for full sync to detect deletes
     if sync_cursor:
         try:
             last_sync = datetime.fromisoformat(sync_cursor)
-            if (datetime.now() - last_sync).days >= 7:
+            now = datetime.now(last_sync.tzinfo)  # Use the same timezone as sync_cursor
+            if (now - last_sync).days >= 7:
                 log.info("Forcing full sync due to age of sync_cursor.")
                 sync_cursor = None
         except Exception as e:
@@ -130,14 +132,12 @@ def update(configuration: dict, state: dict):
         log.info(f"Current IDs (merged if incremental): {current_ids}")
         log.info(f"Current IDs: {current_ids}")
 
-        # DELETE detection
-        deleted_ids = previous_ids - current_ids
-        log.info(f"Deleted IDs in sheet {sheet_id}: {deleted_ids}")
-        for deleted_id in deleted_ids:
-            try:
+        if sync_cursor is None:
+            # Full sync: perform delete detection
+            deleted_ids = previous_ids - current_ids
+            for deleted_id in deleted_ids:
                 yield op.delete(table_name, {"id": deleted_id})
-            except Exception as e:
-                log.severe(f"Failed to delete row {deleted_id} in sheet {sheet_id}: {e}")
+        # else: skip delete detection
 
         # Update state per sheet
         all_state_ids[sheet_id] = list(current_ids)
