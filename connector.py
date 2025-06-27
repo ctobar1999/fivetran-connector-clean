@@ -8,6 +8,7 @@
 # and the Best Practices documentation (https://fivetran.com/docs/connectors/connector-sdk/best-practices) for details
 
 # Import required classes from fivetran_connector_sdk
+from calendar import c
 from fivetran_connector_sdk import Connector, Logging as log, Operations as op # For supporting Connector operations like Update() and Schema()
 import requests
 import json
@@ -21,26 +22,52 @@ import pytz
 # https://fivetran.com/docs/connectors/connector-sdk/technical-reference#schema
 # The schema function takes one parameter:
 # - configuration: a dictionary that holds the configuration settings for the connector.
+
+def format_table_name(sheet_name):
+    return sheet_name.lower().replace(" ", "_")
+
 def schema(configuration: dict):
+    api_token = configuration.get('smartsheet_api_token')
     sheet_ids_raw = configuration.get("smartsheet_sheet_ids", "")
     sheet_ids = [s.strip() for s in sheet_ids_raw.split(",") if s.strip()]
-    return [
-        {
-            "table": f"smartsheet_{sheet_id}",
+    tables = []
+    for sheet_id in sheet_ids:
+        try:
+            api_url = f"https://api.smartsheet.com/2.0/sheets/{sheet_id}"
+            response = requests.get(api_url, headers={'Authorization': f'Bearer {api_token}'})
+            response.raise_for_status()
+            data = response.json()
+            sheet_name = data.get("name", f"smartsheet_{sheet_id}")
+            table_name = format_table_name(sheet_name)
+        except Exception:
+            table_name = f"smartsheet_{sheet_id}"
+        tables.append({
+            "table": table_name,
             "primary_key": ["id"]
-        }
-        for sheet_id in sheet_ids
-    ]
+        })
+    return tables
 
 def update(configuration: dict, state: dict):
     api_token = configuration.get('smartsheet_api_token')
     sheet_ids_raw = configuration.get("smartsheet_sheet_ids", "")
     sheet_ids = [s.strip() for s in sheet_ids_raw.split(",") if s.strip()]
     sync_cursor = state.get('sync_cursor')
+    # sync_cursor = None
+    # 7-day window for full sync to detect deletes
+    if sync_cursor:
+        try:
+            last_sync = datetime.fromisoformat(sync_cursor)
+            now = datetime.now(last_sync.tzinfo)  # Use the same timezone as sync_cursor
+            if (now - last_sync).days >= 7:
+                log.info("Forcing full sync due to age of sync_cursor.")
+                sync_cursor = None
+        except Exception as e:
+            log.info(f"Could not parse sync_cursor: {e}. Forcing full sync.")
+            sync_cursor = None
 
     # Use Pacific time and subtract 2 minutes to avoid future/near-future timestamps
     pacific = pytz.timezone('US/Pacific')
-    sync_start = (datetime.now(pacific) - timedelta(minutes=2)).replace(microsecond=0).isoformat()
+    sync_start = datetime.now(pacific).replace(microsecond=0).isoformat()
 
     if not api_token or not sheet_ids:
         log.severe("Missing API token or sheet IDs in configuration.")
@@ -66,6 +93,8 @@ def update(configuration: dict, state: dict):
             response.raise_for_status()
             data = response.json()
             log.info("Sheet fetch successful")
+            sheet_name = data.get("name", f"smartsheet_{sheet_id}")
+            table_name = format_table_name(sheet_name)
         except Exception as e:
             log.severe(f"Failed to fetch sheet {sheet_id}: {e}")
             continue
@@ -91,30 +120,24 @@ def update(configuration: dict, state: dict):
                     if column_name:
                         row_data[column_name] = cell.get('value')
 
-                yield op.upsert(f"smartsheet_{sheet_id}", row_data)
+                yield op.upsert(table_name, row_data)
                 processed_rows += 1
             except Exception as e:
                 log.severe(f"Error processing row {row.get('id', 'unknown')} in sheet {sheet_id}: {e}")
                 continue
 
-        if sync_cursor:
-                    current_ids = previous_ids.union(new_ids)  # Preserve existing
-        else:
-                    current_ids = new_ids  # Trust the full dataset
-
-
+        current_ids = new_ids
+        print(current_ids)
         log.info(f"Processed {processed_rows} rows for sheet {sheet_id}")
         log.info(f"Current IDs (merged if incremental): {current_ids}")
         log.info(f"Current IDs: {current_ids}")
 
-        # DELETE detection
-        deleted_ids = previous_ids - current_ids
-        log.info(f"Deleted IDs in sheet {sheet_id}: {deleted_ids}")
-        for deleted_id in deleted_ids:
-            try:
-                yield op.delete(f"smartsheet_{sheet_id}", {"id": deleted_id})
-            except Exception as e:
-                log.severe(f"Failed to delete row {deleted_id} in sheet {sheet_id}: {e}")
+        if sync_cursor is None:
+            # Full sync: perform delete detection
+            deleted_ids = previous_ids - current_ids
+            for deleted_id in deleted_ids:
+                yield op.delete(table_name, {"id": deleted_id})
+        # else: skip delete detection
 
         # Update state per sheet
         all_state_ids[sheet_id] = list(current_ids)
