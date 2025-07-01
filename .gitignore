@@ -1,1 +1,4 @@
 myenv
+files/state.json
+files/warehouse.db
+__pycache__/connector.cpython-312.pyc
