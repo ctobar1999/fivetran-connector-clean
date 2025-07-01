@@ -27,11 +27,20 @@ def format_table_name(sheet_name):
     return sheet_name.lower().replace(" ", "_")
 
 def schema(configuration: dict):
+    
+    #Pull smartsheets API Token & sheets ID from configuration.json file
     api_token = configuration.get('smartsheet_api_token')
     sheet_ids_raw = configuration.get("smartsheet_sheet_ids", "")
+
+    #Multiple sheets are seperated with comma, split them to get our list of sheets we need to iterate through
     sheet_ids = [s.strip() for s in sheet_ids_raw.split(",") if s.strip()]
     tables = []
+
+    #Iterate through all the sheets that were pulled in lines above
     for sheet_id in sheet_ids:
+
+        #Pulls information from Smartsheets API to grab data inside of tables, as well as sheet name & table name
+        #If it fails, creates a table with just the smartsheet sheet ID as the name
         try:
             api_url = f"https://api.smartsheet.com/2.0/sheets/{sheet_id}"
             response = requests.get(api_url, headers={'Authorization': f'Bearer {api_token}'})
@@ -41,17 +50,26 @@ def schema(configuration: dict):
             table_name = format_table_name(sheet_name)
         except Exception:
             table_name = f"smartsheet_{sheet_id}"
+
+        #Adds a dictionary with the table name, as well as the primary key to list created earlier
         tables.append({
             "table": table_name,
             "primary_key": ["id"]
         })
+        
     return tables
 
 def update(configuration: dict, state: dict):
+
+    #Pulls the API Tokens, as well as the sheet names from configuration file
     api_token = configuration.get('smartsheet_api_token')
     sheet_ids_raw = configuration.get("smartsheet_sheet_ids", "")
+
+    #Multiple sheets are seperated with comma, split them to get our list of sheets we need to iterate through
+    #Also pull the current state of where our sync cursor is
     sheet_ids = [s.strip() for s in sheet_ids_raw.split(",") if s.strip()]
     sync_cursor = state.get('sync_cursor')
+
     # sync_cursor = None
     # 7-day window for full sync to detect deletes
     if sync_cursor:
@@ -69,13 +87,17 @@ def update(configuration: dict, state: dict):
     pacific = pytz.timezone('US/Pacific')
     sync_start = datetime.now(pacific).replace(microsecond=0).isoformat()
 
+    #Catch statement if there is a missing API token/ sheet ID in config file
     if not api_token or not sheet_ids:
         log.severe("Missing API token or sheet IDs in configuration.")
         raise ValueError("API token and sheet IDs are required.")
 
+    #Grab the last sync times for the sheet IDs that were pulled
     all_state_ids = state.get("all_ids", {})
 
+    #Iterate through all the sheet IDs
     for sheet_id in sheet_ids:
+        #Logs what sheet is being worked on
         log.info(f"Processing Sheet ID: {sheet_id}")
 
         # Build the API URL
@@ -88,6 +110,7 @@ def update(configuration: dict, state: dict):
 
         log.info(f"Fetching data from: {api_url}")
 
+        #Try catch block to query information from smartsheets API
         try:
             response = requests.get(api_url, headers={'Authorization': f'Bearer {api_token}'})
             response.raise_for_status()
@@ -99,12 +122,18 @@ def update(configuration: dict, state: dict):
             log.severe(f"Failed to fetch sheet {sheet_id}: {e}")
             continue
 
+        #Iterate through dictionary mapping of the columns from data pulled above for that sheet and map its column id to the title
         column_mapping = {col['id']: col['title'] for col in data.get('columns', [])}
+        
+        #Grab the sheet ids from last snyc, if does not exist, return an empty list
         previous_ids = set(all_state_ids.get(sheet_id, []))
         new_ids = set()
         processed_rows = 0
 
+        #Iterate through all rows from row data for that given sheet ID
         for row in data.get('rows', []):
+
+            #Try catch block for processing rows, logs if it's not able to process a certain row
             try:
                 row_id = row.get('id')
                 new_ids.add(row_id)
@@ -115,17 +144,26 @@ def update(configuration: dict, state: dict):
                     'created_at': row.get('createdAt'),
                     'modified_at': row.get('modifiedAt')
                 }
+
+                #Iterate through all information that was stored inside that row 
                 for cell in row.get('cells', []):
                     column_name = column_mapping.get(cell.get('columnId'))
+
+                    #If column has a name from smartsheets, create new row and append it to row_data
                     if column_name:
                         row_data[column_name] = cell.get('value')
 
+                #Upsert processed data for that table name with it's row data
                 yield op.upsert(table_name, row_data)
+
+                #Increase processed row by 1
                 processed_rows += 1
+
             except Exception as e:
                 log.severe(f"Error processing row {row.get('id', 'unknown')} in sheet {sheet_id}: {e}")
                 continue
 
+        #Replace current IDs with new ID
         current_ids = new_ids
         print(current_ids)
         log.info(f"Processed {processed_rows} rows for sheet {sheet_id}")
